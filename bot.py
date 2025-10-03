@@ -1,49 +1,31 @@
-import os
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
+import os
+from keep_alive import keep_alive  # file keep_alive.py bạn tạo riêng
 
-# Load biến môi trường từ .env
-load_dotenv()
+# Gọi webserver giữ bot sống
+keep_alive()
+
+# Lấy token từ biến môi trường trên Render
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Tạo bot
 intents = discord.Intents.default()
-intents.message_content = True  # Cho phép đọc tin nhắn
+intents.message_content = True  # để bot đọc được tin nhắn
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Sự kiện bot online
+# Khi bot login thành công
 @bot.event
 async def on_ready():
-    print(f"✅ Bot đã đăng nhập thành công dưới tên {bot.user}")
+    print(f"✅ Bot {bot.user} is online and connected to Discord!")
 
-# Lệnh test
+# Command test
 @bot.command()
 async def ping(ctx):
-    await ctx.send("Pong!")
+    await ctx.send("Pong! 🏓")
 
-# ----------------------
-# Flask keep-alive server
-# ----------------------
-from flask import Flask
-import threading
-
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = threading.Thread(target=run)
-    t.start()
-
-# ----------------------
 # Chạy bot
-# ----------------------
-if __name__ == "__main__":
-    keep_alive()        # giữ cho bot luôn sống (Render không sleep)
+if TOKEN is None:
+    print("❌ ERROR: DISCORD_TOKEN not found in environment variables")
+else:
     bot.run(TOKEN)
