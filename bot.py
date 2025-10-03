@@ -1,678 +1,231 @@
-import discord
-from discord.ext import commands
-import os
-from keep_alive import keep_alive  # file keep_alive.py bạn tạo riêng
-
-# Gọi webserver giữ bot sống
-keep_alive()
-
-# Lấy token từ biến môi trường trên Render
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-# Tạo bot
-intents = discord.Intents.default()
-intents.message_content = True  # để bot đọc được tin nhắn
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# Khi bot login thành công
-@bot.event
-async def on_ready():
-    print(f"✅ Bot {bot.user} is online and connected to Discord!")
-
-# Command test
-@bot.command()
-async def ping(ctx):
-    await ctx.send("Pong! 🏓")
-
-# Chạy bot
-if TOKEN is None:
-    print("❌ ERROR: DISCORD_TOKEN not found in environment variables")
-else:
-    bot.run(TOKEN)
-    # bot.py
-# Requires: Python 3.8+, discord.py 2.x, python-dotenv, flask (for keep-alive)
-# pip install -U "discord.py" python-dotenv flask
-
-import os
-import discord
-from discord.ext import commands
-import json
-import asyncio
+# bot.py
+import discord, os, json, random, asyncio, traceback
+from discord.ext import commands, tasks
 from datetime import datetime, timedelta
-import random
-import traceback
-from dotenv import load_dotenv
+from keep_alive import keep_alive
+import openai
 
-# ---------------------------
-# Keep-alive (simple Flask)
-# ---------------------------
-# If you already have a keep_alive.py or use another approach, you can remove this.
-try:
-    from flask import Flask
-    from threading import Thread
-
-    app = Flask("")
-
-    @app.route("/")
-    def home():
-        return "Bot is alive!"
-
-    @app.route("/health")
-    def health():
-        return "OK", 200
-
-    def _run_flask():
-        app.run(host="0.0.0.0", port=8080)
-
-    def keep_alive():
-        t = Thread(target=_run_flask)
-        t.daemon = True
-        t.start()
-except Exception:
-    def keep_alive():
-        return
-# ---------------------------
-
-load_dotenv()
+# ==== CONFIG ====
+BOT_PREFIX = "?"
+DATA_FILE = "bot_data.json"
+OWNER_ID = 123456789012345678  # đổi thành ID owner
 TOKEN = os.getenv("DISCORD_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")  # thêm key vào Render
+openai.api_key = OPENAI_KEY
 
 INTENTS = discord.Intents.default()
 INTENTS.members = True
 INTENTS.message_content = True
+bot = commands.Bot(command_prefix=BOT_PREFIX, intents=INTENTS)
 
-BOT_PREFIX = "!"
-DATA_FILE = "bot_data.json"
+# ==== DATA ====
+default_data = {"coins":{}, "hourly":{}, "quiz":{}, "bets":{}, "stocks":{}}
 
-bot = commands.Bot(command_prefix=BOT_PREFIX, intents=INTENTS,
-                   help_command=commands.DefaultHelpCommand(no_category="Commands"))
+def load():
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE,"w") as f: json.dump(default_data,f)
+    return json.load(open(DATA_FILE,"r"))
 
-# ---------------------------
-# Data storage (thread-safe save)
-# ---------------------------
-default_data = {
-    "xp": {},         # user_id -> xp (int)
-    "eco": {},        # user_id -> { "bal": int, "daily": iso, "hourly": iso, "inv": {item:qty} }
-    "quiz": {},       # guild_id -> quiz session
-}
+def save(d): open(DATA_FILE,"w").write(json.dumps(d,indent=2))
+data = load()
 
-# ensure file exists
-if not os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "w") as f:
-        json.dump(default_data, f, indent=2)
+# ==== HELPERS ====
+def bal(uid): return data["coins"].get(str(uid),0)
+def add(uid,amt): data["coins"][str(uid)]=bal(uid)+amt; save(data)
+def can_hr(uid,h=1):
+    u=str(uid); last=data["hourly"].get(u)
+    if not last: return True,None
+    diff=datetime.utcnow()-datetime.fromisoformat(last)
+    remain=timedelta(hours=h)-diff
+    return remain<=timedelta(0),remain if remain>timedelta(0) else None
+def set_hr(uid): data["hourly"][str(uid)]=datetime.utcnow().isoformat(); save(data)
 
-# load once at start
-with open(DATA_FILE, "r") as f:
-    data = json.load(f)
+# ==== KEEP ALIVE ====
+keep_alive()
 
-# async-safe save
-def _save_sync():
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-async def save_data_async():
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _save_sync)
-
-# ---------------------------
-# Helper - economy & xp
-# ---------------------------
-def _ensure_user_eco(uid: str):
-    if uid not in data["eco"]:
-        data["eco"][uid] = {"bal": 0, "daily": None, "hourly": None, "inv": {}}
-
-def get_balance(user_id):
-    uid = str(user_id)
-    _ensure_user_eco(uid)
-    return int(data["eco"][uid].get("bal", 0))
-
-async def add_balance(user_id, amount):
-    uid = str(user_id)
-    _ensure_user_eco(uid)
-    data["eco"][uid]["bal"] = int(data["eco"][uid].get("bal", 0)) + int(amount)
-    await save_data_async()
-
-def get_xp(user_id):
-    return int(data["xp"].get(str(user_id), 0))
-
-async def add_xp_async(user_id, amount):
-    uid = str(user_id)
-    data["xp"][uid] = int(data["xp"].get(uid, 0)) + int(amount)
-    await save_data_async()
-
-# Level system
-def get_level(xp: int) -> int:
-    return xp // 100
-
-def xp_for_next_level(level: int) -> int:
-    return (level + 1) * 100
-
-async def add_xp_and_check_level(user, amount, channel=None):
-    uid = user.id
-    old_xp = get_xp(uid)
-    old_level = get_level(old_xp)
-    await add_xp_async(uid, amount)
-    new_xp = get_xp(uid)
-    new_level = get_level(new_xp)
-    if new_level > old_level and channel:
-        try:
-            await channel.send(f"🎉 {user.mention} đã lên **Level {new_level}**! (XP: {new_xp})")
-        except Exception:
-            pass
-    return new_xp, new_level
-
-# cooldown util
-def _get_iso(dt: datetime):
-    return dt.isoformat()
-
-def _from_iso(s):
-    return datetime.fromisoformat(s) if s else None
-
-# ---------------------------
-# Shop items (example)
-# ---------------------------
-SHOP = {
-    "apple": {"price": 20, "desc": "Một quả táo (+0)"},
-    "sword": {"price": 500, "desc": "Kiếm gỗ để khoe với bạn bè"},
-    "fishing_rod": {"price": 200, "desc": "Cần câu giúp bạn fish tốt hơn"},
-}
-
-# ---------------------------
-# Mini-games helpers
-# ---------------------------
-FISH_TABLE = [
-    ("Old Boot", 0),
-    ("Small Fish", 10),
-    ("Big Fish", 30),
-    ("Golden Fish", 100),
-]
-
-# ---------------------------
-# Events
-# ---------------------------
+# ==== EVENTS ====
 @bot.event
 async def on_ready():
-    print(f"Bot is ready. Logged in as {bot.user} (ID: {bot.user.id})")
-    keep_alive()  # start keep-alive server (no-op if Flask missing)
-    print("Keep-alive started (if available).")
-    print("------")
+    print(f"✅ Bot {bot.user} online")
+    stock_update.start()
 
-# simple chat XP (cooldown 60s)
-chat_cooldowns = {}  # user_id -> datetime
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
+# ==== BASIC ====
+@bot.command()
+async def ping(ctx): await ctx.send(f"Pong {round(bot.latency*1000)}ms")
 
-    uid = message.author.id
-    now = datetime.utcnow()
-    last = chat_cooldowns.get(uid)
-    if not last or (now - last).total_seconds() >= 60:
-        xp_gain = random.randint(5, 15)
-        await add_xp_and_check_level(message.author, xp_gain, message.channel)
-        chat_cooldowns[uid] = now
+@bot.command()
+async def bal(ctx,m:discord.Member=None):
+    m=m or ctx.author
+    await ctx.send(f"{m.display_name} có {bal(m.id)} 💰 Skibidi Coin")
 
-    await bot.process_commands(message)
+@bot.command()
+async def lb(ctx,top:int=10):
+    arr=[(int(u),c) for u,c in data["coins"].items()]
+    arr.sort(key=lambda x:x[1],reverse=True)
+    if not arr: return await ctx.send("Chưa có ai có coin")
+    emb=discord.Embed(title="🏆 Leaderboard",color=discord.Color.gold())
+    for i,(uid,c) in enumerate(arr[:top],1):
+        mem=ctx.guild.get_member(uid)
+        emb.add_field(name=f"#{i} {mem.display_name if mem else uid}",value=f"{c} 💰",inline=False)
+    await ctx.send(embed=emb)
 
-# ---------------------------
-# Basic commands & economy
-# ---------------------------
-@bot.command(name="ping")
-async def ping_cmd(ctx):
-    latency = round(bot.latency * 1000)
-    await ctx.send(f"Pong! 🏓 Độ trễ: {latency}ms")
+@bot.command()
+async def hr(ctx):
+    ok,remain=can_hr(ctx.author.id)
+    if not ok: return await ctx.send(f"Đợi {int(remain.total_seconds()//60)}m nữa")
+    reward=random.randint(10,50); add(ctx.author.id,reward); set_hr(ctx.author.id)
+    await ctx.send(f"{ctx.author.mention} nhận {reward} 💰")
 
-@bot.command(name="bal", aliases=["balance"])
-async def bal_cmd(ctx, member: discord.Member = None):
-    member = member or ctx.author
-    bal = get_balance(member.id)
-    await ctx.send(f"{member.display_name} có **{bal} 💰**.")
+# ==== QUIZ ====
+QUIZ=[{"q":"2+2?","a":"4"},{"q":"Thủ đô Nhật Bản?","a":"tokyo"}]
 
-# hourly (1 hour)
-@bot.command(name="hr", aliases=["hourly", "claim"])
-async def hourly_cmd(ctx):
-    uid = str(ctx.author.id)
-    _ensure_user_eco(uid)
-    last = _from_iso(data["eco"][uid].get("hourly"))
-    now = datetime.utcnow()
-    if last and (now - last) < timedelta(hours=1):
-        rem = timedelta(hours=1) - (now - last)
-        mins = int(rem.total_seconds() // 60)
-        secs = int(rem.total_seconds() % 60)
-        await ctx.send(f"Đã claim rồi. Hãy chờ {mins} phút {secs} giây.")
-        return
-    reward = random.randint(10, 50)
-    await add_balance(ctx.author.id, reward)
-    data["eco"][uid]["hourly"] = _get_iso(now)
-    await save_data_async()
-    await add_xp_and_check_level(ctx.author, random.randint(5, 15), ctx.channel)
-    await ctx.send(f"{ctx.author.mention} nhận **{reward} 💰** từ hourly!")
+@bot.group(invoke_without_command=True)
+async def quiz(ctx): await ctx.send("Dùng ?quiz start / answer / end")
 
-# daily (24h)
-@bot.command(name="daily")
-async def daily_cmd(ctx):
-    uid = str(ctx.author.id)
-    _ensure_user_eco(uid)
-    last = _from_iso(data["eco"][uid].get("daily"))
-    now = datetime.utcnow()
-    if last and (now - last) < timedelta(hours=24):
-        rem = timedelta(hours=24) - (now - last)
-        hrs = int(rem.total_seconds() // 3600)
-        mins = int((rem.total_seconds() % 3600) // 60)
-        await ctx.send(f"Đã nhận daily rồi. Hãy chờ {hrs} giờ {mins} phút.")
-        return
-    reward = random.randint(100, 500)
-    await add_balance(ctx.author.id, reward)
-    data["eco"][uid]["daily"] = _get_iso(now)
-    await save_data_async()
-    await add_xp_and_check_level(ctx.author, random.randint(10, 30), ctx.channel)
-    await ctx.send(f"{ctx.author.mention} nhận **{reward} 💰** từ daily!")
+@quiz.command()
+async def start(ctx):
+    g=str(ctx.guild.id)
+    if data["quiz"].get(g,{}).get("active"): return await ctx.send("Đang có quiz")
+    q=random.choice(QUIZ); data["quiz"][g]={"q":q["q"],"a":q["a"],"active":True,"pts":{}}
+    save(data); await ctx.send(f"🎲 Quiz: {q['q']}")
 
-# work (cooldown 30m)
-work_cooldowns = {}
-@bot.command(name="work")
-async def work_cmd(ctx):
-    uid = str(ctx.author.id)
-    now = datetime.utcnow()
-    last = work_cooldowns.get(uid)
-    if last and (now - last).total_seconds() < 30*60:
-        rem = 30*60 - (now - last).total_seconds()
-        mins = int(rem // 60); secs = int(rem % 60)
-        await ctx.send(f"Hãy đợi {mins} phút {secs} giây để work tiếp.")
-        return
-    reward = random.randint(50, 150)
-    await add_balance(ctx.author.id, reward)
-    work_cooldowns[uid] = now
-    await add_xp_and_check_level(ctx.author, random.randint(5, 20), ctx.channel)
-    await ctx.send(f"{ctx.author.mention} đi làm và nhận **{reward} 💰**!")
+@quiz.command()
+async def answer(ctx,*,ans):
+    g=str(ctx.guild.id); s=data["quiz"].get(g)
+    if not s or not s["active"]: return await ctx.send("Không có quiz")
+    if ans.lower()==s["a"]:
+        s["pts"][str(ctx.author.id)]=s["pts"].get(str(ctx.author.id),0)+1
+        add(ctx.author.id,20); save(data)
+        await ctx.send(f"{ctx.author.mention} đúng! +20 💰")
+    else: await ctx.send("Sai rồi!")
 
-# crime (risky)
-@bot.command(name="crime")
-async def crime_cmd(ctx):
-    uid = str(ctx.author.id)
-    success = random.random() < 0.45  # 45% success
-    if success:
-        reward = random.randint(80, 300)
-        await add_balance(ctx.author.id, reward)
-        await add_xp_and_check_level(ctx.author, random.randint(10, 30), ctx.channel)
-        await ctx.send(f"🕶️ {ctx.author.mention} thực hiện thành công và lấy **{reward} 💰**.")
-    else:
-        loss = random.randint(30, 150)
-        bal = get_balance(ctx.author.id)
-        new_loss = min(bal, loss)
-        await add_balance(ctx.author.id, -new_loss)
-        await ctx.send(f"❌ {ctx.author.mention} bị bắt! Mất **{new_loss} 💰**.")
+@quiz.command()
+async def end(ctx):
+    g=str(ctx.guild.id); s=data["quiz"].get(g)
+    if not s or not s["active"]: return
+    s["active"]=False; pts=s["pts"]; save(data)
+    if not pts: return await ctx.send("Kết thúc, không ai ghi điểm")
+    emb=discord.Embed(title="Kết quả Quiz")
+    for i,(uid,p) in enumerate(sorted(pts.items(), key=lambda x:x[1],reverse=True),1):
+        m=ctx.guild.get_member(int(uid))
+        emb.add_field(name=f"#{i} {m.display_name if m else uid}",value=f"{p} điểm")
+    await ctx.send(embed=emb)
 
-# ---------------------------
-# Shop & inventory
-# ---------------------------
-@bot.command(name="shop")
-async def shop_cmd(ctx):
-    lines = ["🛒 **Shop**"]
-    for key, v in SHOP.items():
-        lines.append(f"`{key}` — {v['price']}💰 — {v['desc']}")
-    await ctx.send("\n".join(lines))
+# ==== HORSE RACE ====
+HORSES=["🐎","🏇","🐴","🦄"]
 
-@bot.command(name="buy")
-async def buy_cmd(ctx, item: str, qty: int = 1):
-    item = item.lower()
-    if item not in SHOP:
-        await ctx.send("Không tồn tại item này trong shop.")
-        return
-    if qty < 1:
-        await ctx.send("Số lượng phải lớn hơn 0.")
-        return
-    price = SHOP[item]["price"] * qty
-    bal = get_balance(ctx.author.id)
-    if bal < price:
-        await ctx.send("Bạn không đủ tiền.")
-        return
-    await add_balance(ctx.author.id, -price)
-    uid = str(ctx.author.id)
-    _ensure_user_eco(uid)
-    inv = data["eco"][uid].get("inv", {})
-    inv[item] = inv.get(item, 0) + qty
-    data["eco"][uid]["inv"] = inv
-    await save_data_async()
-    await ctx.send(f"🛍️ Mua thành công {qty} x {item} (đã trừ {price}💰).")
-
-@bot.command(name="inv", aliases=["inventory"])
-async def inv_cmd(ctx, member: discord.Member = None):
-    member = member or ctx.author
-    uid = str(member.id)
-    _ensure_user_eco(uid)
-    inv = data["eco"][uid].get("inv", {})
-    if not inv:
-        await ctx.send(f"{member.display_name} không có item nào.")
-        return
-    lines = [f"📦 **{member.display_name} Inventory**"]
-    for k, v in inv.items():
-        lines.append(f"{k}: {v}")
-    await ctx.send("\n".join(lines))
-
-# ---------------------------
-# Mini-games
-# ---------------------------
-@bot.command(name="fish")
-async def fish_cmd(ctx):
-    uid = str(ctx.author.id)
-    _ensure_user_eco(uid)
-    # chance influenced by fishing_rod
-    inv = data["eco"][uid].get("inv", {})
-    rod = inv.get("fishing_rod", 0)
-    roll = random.random()
-    if rod > 0:
-        # better odds
-        choices = [("Old Boot", 0), ("Small Fish", 20), ("Big Fish", 60), ("Golden Fish", 200)]
-    else:
-        choices = FISH_TABLE
-    item, value = random.choices(choices, weights=[50, 30, 15, 5], k=1)[0]
-    if value > 0:
-        await add_balance(ctx.author.id, value)
-        await add_xp_and_check_level(ctx.author, random.randint(5, 15), ctx.channel)
-        await ctx.send(f"🎣 {ctx.author.mention} đã câu được **{item}** và bán được **{value}💰**.")
-    else:
-        await ctx.send(f"🎣 {ctx.author.mention} câu được **{item}**. Chúc lần sau may mắn!")
-
-@bot.command(name="guess")
-async def guess_cmd(ctx, number: int):
-    if number < 1 or number > 10:
-        await ctx.send("Hãy đoán số trong khoảng 1-10.")
-        return
-    answer = random.randint(1, 10)
-    if number == answer:
-        reward = random.randint(15, 40)
-        await add_balance(ctx.author.id, reward)
-        await add_xp_and_check_level(ctx.author, random.randint(5, 15), ctx.channel)
-        await ctx.send(f"🎉 Chính xác {ctx.author.mention}! Số là **{answer}**. Bạn nhận **{reward}💰**.")
-    else:
-        await ctx.send(f"😢 Sai rồi {ctx.author.mention}. Số đúng: **{answer}**.")
-
-@bot.command(name="coinflip")
-async def coinflip_cmd(ctx, choice: str):
-    choice = choice.lower()
-    if choice not in ("head", "tail", "h", "t"):
-        await ctx.send("Dùng `!coinflip head` hoặc `!coinflip tail`.")
-        return
-    pick = "head" if choice.startswith("h") else "tail"
-    result = random.choice(["head", "tail"])
-    if pick == result:
-        reward = 50
-        await add_balance(ctx.author.id, reward)
-        await add_xp_and_check_level(ctx.author, random.randint(5, 15), ctx.channel)
-        await ctx.send(f"🎯 {ctx.author.mention} thắng! Kết quả: **{result}**. +{reward}💰")
-    else:
-        loss = 25
-        await add_balance(ctx.author.id, -loss)
-        await ctx.send(f"😵 {ctx.author.mention} thua! Kết quả: **{result}**. -{loss}💰")
-
-@bot.command(name="slots")
-async def slots_cmd(ctx):
-    emojis = ["🍒", "🍋", "🔔", "⭐", "7️⃣"]
-    res = [random.choice(emojis) for _ in range(3)]
-    await ctx.send(" | ".join(res))
-    if res[0] == res[1] == res[2]:
-        reward = 150
-        await add_balance(ctx.author.id, reward)
-        await add_xp_and_check_level(ctx.author, random.randint(10, 30), ctx.channel)
-        await ctx.send(f"🎉 JACKPOT! Bạn được +{reward}💰")
-    else:
-        loss = 30
-        await add_balance(ctx.author.id, -loss)
-        await ctx.send(f"😕 Không trúng. Mất {loss}💰")
-
-# ---------------------------
-# Leaderboard
-# ---------------------------
-@bot.command(name="lb", aliases=["leaderboard"])
-async def leaderboard(ctx, top: int = 10):
-    eco = data.get("eco", {})
-    items = []
-    for uid, info in eco.items():
-        bal = int(info.get("bal", 0))
-        items.append((int(uid), bal))
-    if not items:
-        await ctx.send("Không có dữ liệu.")
-        return
-    items.sort(key=lambda x: x[1], reverse=True)
-    embed = discord.Embed(title="🏆 Leaderboard (by balance)", color=discord.Color.gold())
-    for i, (uid, bal) in enumerate(items[:top], start=1):
-        member = ctx.guild.get_member(uid)
-        name = member.display_name if member else f"User ID {uid}"
-        embed.add_field(name=f"#{i} — {name}", value=f"{bal} 💰", inline=False)
-    await ctx.send(embed=embed)
-
-# ---------------------------
-# Quiz system (kept from original)
-# ---------------------------
-QUIZ_QUESTIONS = [
-    {"q": "Thủ đô của Pháp là gì?", "a": "paris"},
-    {"q": "2+2 bằng mấy?", "a": "4"},
-    {"q": "Ngôn ngữ lập trình có logo con rùa là gì?", "a": "logo"},
-]
-
-@bot.group(name="quizgroup", invoke_without_command=True)
-async def quizroot(ctx):
-    await ctx.send_help(ctx.command)
-
-@quizroot.command(name="start")
-@commands.cooldown(1, 10, commands.BucketType.guild)
-async def quizroot_start(ctx):
-    gid = str(ctx.guild.id)
-    if data["quiz"].get(gid, {}).get("active"):
-        await ctx.send("Đã có quiz đang chạy trên server này.")
-        return
-    q = random.choice(QUIZ_QUESTIONS)
-    session = {
-        "question": q["q"],
-        "answer": q["a"].lower(),
-        "host": ctx.author.id,
-        "points": {},
-        "active": True
-    }
-    data["quiz"][gid] = session
-    await save_data_async()
-    await ctx.send(f"🎲 **Quiz started!**\nCâu hỏi: **{q['q']}**\nTrả lời bằng lệnh `!quizgroup answer <câu trả lời>`")
-
-@quizroot.command(name="answer")
-async def quizroot_answer(ctx, *, ans: str):
-    gid = str(ctx.guild.id)
-    session = data["quiz"].get(gid)
-    if not session or not session.get("active"):
-        await ctx.send("Không có quiz đang hoạt động.")
-        return
-    if ans.strip().lower() == session["answer"]:
-        uid = str(ctx.author.id)
-        session["points"][uid] = session["points"].get(uid, 0) + 1
-        await add_xp_and_check_level(ctx.author, 20, ctx.channel)
-        await save_data_async()
-        await ctx.send(f"✅ Chính xác {ctx.author.mention}! +1 điểm và +20 XP")
-    else:
-        await ctx.send("Sai rồi — thử lại!")
-
-@quizroot.command(name="end")
-async def quizroot_end(ctx):
-    gid = str(ctx.guild.id)
-    session = data["quiz"].get(gid)
-    if not session or not session.get("active"):
-        await ctx.send("Không có quiz đang hoạt động.")
-        return
-    if ctx.author.id != session.get("host") and not ctx.author.guild_permissions.manage_guild:
-        await ctx.send("Chỉ host quiz hoặc người quản lý server mới có thể kết thúc quiz.")
-        return
-    session["active"] = False
-    points = session.get("points", {})
-    if not points:
-        await ctx.send("Quiz kết thúc — không ai ghi điểm.")
-    else:
-        sorted_pts = sorted(((int(uid), pts) for uid, pts in points.items()), key=lambda x: x[1], reverse=True)
-        embed = discord.Embed(title="Quiz Results", color=discord.Color.green())
-        for i, (uid, pts) in enumerate(sorted_pts, start=1):
-            member = ctx.guild.get_member(uid)
-            name = member.display_name if member else f"User ID {uid}"
-            embed.add_field(name=f"#{i} — {name}", value=f"{pts} điểm", inline=False)
-        await ctx.send(embed=embed)
-    data["quiz"][gid] = session
-    await save_data_async()
-
-# ---------------------------
-# Owner commands (shutdown/eval)
-# ---------------------------
-def is_owner():
-    async def predicate(ctx):
-        return ctx.author.id == OWNER_ID
-    return commands.check(predicate)
-
-@bot.command(name="shutdown")
-@is_owner()
-async def shutdown(ctx):
-    await ctx.send("Shutting down...")
-    await bot.close()
-
-@bot.command(name="eval")
-@is_owner()
-async def _eval(ctx, *, body: str):
-    env = {
-        'bot': bot,
-        'ctx': ctx,
-        'discord': discord,
-        'asyncio': asyncio,
-        '__import__': __import__
-    }
-    try:
-        code = compile(body, "<eval>", "exec")
-        exec(code, env)
-        await ctx.send("Eval executed.")
-    except Exception as e:
-        tb = traceback.format_exc()
-        await ctx.send(f"Error:\n```\n{tb}\n```")
-
-# ---------------------------
-# Error handlers
-# ---------------------------
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("Thiếu tham số cần thiết.")
-    elif isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"Hãy đợi {error.retry_after:.1f}s.")
-    else:
-        # generic
-        await ctx.send(f"Lỗi: {error}")
-
-# ---------------------------
-# Run bot (no token hardcoded)
-# ---------------------------
-if __name__ == "__main__":
-    if not TOKEN:
-        print("ERROR: DISCORD_TOKEN not set. Put DISCORD_TOKEN in your .env or environment variables.")
-    else:
-        bot.run(TOKEN)
-active_races = {}  # guild_id -> {"horses": [...], "bets": {}, "message_id": int}
-
-HORSES = [
-    {"name": "🐴 Ngựa Lửa", "speed": 8, "stamina": 6},
-    {"name": "🦄 Unicorn Skibidi", "speed": 7, "stamina": 9},
-    {"name": "🐎 Ngựa Chiến", "speed": 6, "stamina": 8},
-    {"name": "🦬 Skibidi Trâu", "speed": 5, "stamina": 10}
-]
-
-@bot.command(name="race")
+@bot.command()
 async def race(ctx):
-    gid = str(ctx.guild.id)
-    if gid in active_races:
-        await ctx.send("Hiện đang có cuộc đua diễn ra, hãy tham gia!")
-        return
-
-    horses = random.sample(HORSES, 3)
-    desc = "\n".join([f"{i+1}. {h['name']} (Speed: {h['speed']}, Stamina: {h['stamina']})"
-                      for i, h in enumerate(horses)])
-    embed = discord.Embed(
-        title="🏇 Cuộc đua Skibidi bắt đầu!",
-        description=desc,
-        color=discord.Color.blue()
-    )
-    embed.set_footer(text="Dùng lệnh ?bet <số> <coin> để đặt cược (30s).")
-
-    msg = await ctx.send(embed=embed)
-    active_races[gid] = {"horses": horses, "bets": {}, "message_id": msg.id}
-
-    # sau 30s nếu không ai bet thì hủy
+    g=str(ctx.guild.id)
+    if g in data["bets"]: return await ctx.send("Đang có race")
+    msg=await ctx.send("🐎 Đua ngựa! cược bằng ?bet <số> <coin>")
+    data["bets"][g]={"bets":{},"msg":msg.id}; save(data)
     await asyncio.sleep(30)
-    if gid in active_races and not active_races[gid]["bets"]:
-        try:
-            m = await ctx.channel.fetch_message(msg.id)
-            await m.delete()
-        except:
-            pass
-        del active_races[gid]
-        await ctx.send("⏰ Hết giờ, không ai đặt cược. Cuộc đua bị hủy.")
+    if not data["bets"][g]["bets"]: 
+        await msg.delete(); data["bets"].pop(g); save(data)
 
-@bot.command(name="bet")
-async def bet(ctx, horse_index: int, amount: int):
-    gid = str(ctx.guild.id)
-    if gid not in active_races:
-        await ctx.send("Không có cuộc đua nào đang diễn ra.")
-        return
+@bot.command()
+async def bet(ctx,horse:int,amt:int):
+    g=str(ctx.guild.id); s=data["bets"].get(g)
+    if not s: return
+    if bal(ctx.author.id)<amt: return await ctx.send("Không đủ coin")
+    add(ctx.author.id,-amt); s["bets"][str(ctx.author.id)]={"h":horse,"a":amt}
+    save(data); await ctx.send(f"{ctx.author.display_name} cược {amt} vào {HORSES[horse-1]}")
 
-    horses = active_races[gid]["horses"]
-    if horse_index < 1 or horse_index > len(horses):
-        await ctx.send("Số ngựa không hợp lệ.")
-        return
-
-    balance = get_balance(ctx.author.id)
-    if amount <= 0 or amount > balance:
-        await ctx.send("Bạn không đủ Skibidi Coin để đặt cược.")
-        return
-
-    add_balance(ctx.author.id, -amount)  # trừ coin
-    active_races[gid]["bets"][ctx.author.id] = {"horse": horse_index-1, "amount": amount}
-    await ctx.send(f"{ctx.author.display_name} đã cược {amount} 💰 Skibidi Coin cho {horses[horse_index-1]['name']}!")
-
-@bot.command(name="startrace")
+@bot.command()
 async def startrace(ctx):
-    gid = str(ctx.guild.id)
-    if gid not in active_races:
-        await ctx.send("Không có cuộc đua nào để bắt đầu.")
-        return
+    g=str(ctx.guild.id); s=data["bets"].get(g)
+    if not s: return
+    win=random.randint(1,len(HORSES)); txt=f"🏁 Thắng: {HORSES[win-1]}\n"
+    winners=[]
+    for uid,bet in s["bets"].items():
+        if bet["h"]==win: reward=bet["a"]*2; add(int(uid),reward); winners.append((uid,reward))
+    txt+="\n".join([f"<@{u}> +{r}" for u,r in winners]) if winners else "Không ai thắng"
+    await ctx.send(txt); data["bets"].pop(g); save(data)
 
-    horses = active_races[gid]["horses"]
-    bets = active_races[gid]["bets"]
+# ==== COINFLIP ====
+@bot.command()
+async def coinflip(ctx,amt:int,side:str):
+    if bal(ctx.author.id)<amt: return await ctx.send("Không đủ coin")
+    if side.lower() not in ["heads","tails"]: return await ctx.send("Chọn heads/tails")
+    res=random.choice(["heads","tails"])
+    if res==side.lower(): add(ctx.author.id,amt); await ctx.send(f"Kết quả {res}, bạn thắng {amt} 💰")
+    else: add(ctx.author.id,-amt); await ctx.send(f"Kết quả {res}, bạn thua {amt} 💰")
 
-    if not bets:
-        await ctx.send("Không ai đặt cược, hủy race.")
-        del active_races[gid]
-        return
+# ==== STOCKS ====
+STOCKS=["APPL","MSFT","BTC","ETH"]
 
-    await ctx.send("🚦 Cuộc đua bắt đầu sau 3s...")
-    await asyncio.sleep(3)
+@tasks.loop(minutes=5)
+async def stock_update():
+    for s in STOCKS:
+        price=random.randint(50,500)
+        data["stocks"][s]=price
+    save(data)
 
-    # Random winner
-    scores = [h["speed"] + random.randint(0, h["stamina"]) for h in horses]
-    winner_index = scores.index(max(scores))
-    winner = horses[winner_index]
+@bot.group(invoke_without_command=True)
+async def stock(ctx): await ctx.send("Dùng ?stock prices / buy / sell")
 
-    msg = f"🏁 Kết thúc! {winner['name']} đã chiến thắng!\n"
-    winners = []
-    for uid, bet in bets.items():
-        if bet["horse"] == winner_index:
-            payout = bet["amount"] * 2
-            add_balance(uid, payout)
-            winners.append((uid, payout))
+@stock.command()
+async def prices(ctx):
+    txt="\n".join([f"{s}: {p}💰" for s,p in data["stocks"].items()])
+    await ctx.send(f"📈 Giá cổ phiếu:\n{txt}")
 
-    if winners:
-        for uid, payout in winners:
-            member = ctx.guild.get_member(uid)
-            msg += f"{member.display_name} thắng {payout} 💰 Skibidi Coin!\n"
-    else:
-        msg += "Không ai thắng cược..."
+@stock.command()
+async def buy(ctx,sym:str,amt:int):
+    if sym not in STOCKS: return
+    price=data["stocks"].get(sym,100); cost=price*amt
+    if bal(ctx.author.id)<cost: return await ctx.send("Không đủ coin")
+    add(ctx.author.id,-cost)
+    port=data.setdefault("portfolio",{}).setdefault(str(ctx.author.id),{})
+    port[sym]=port.get(sym,0)+amt; save(data)
+    await ctx.send(f"Mua {amt} {sym} giá {cost}💰")
 
-    await ctx.send(msg)
-    del active_races[gid]
-def get_balance(user_id):
-    return data["coins"].get(str(user_id), 0)
+@stock.command()
+async def sell(ctx,sym:str,amt:int):
+    port=data.setdefault("portfolio",{}).setdefault(str(ctx.author.id),{})
+    if port.get(sym,0)<amt: return await ctx.send("Không đủ cổ phiếu")
+    price=data["stocks"].get(sym,100); gain=price*amt
+    port[sym]-=amt; add(ctx.author.id,gain); save(data)
+    await ctx.send(f"Bán {amt} {sym}, nhận {gain}💰")
 
-def add_balance(user_id, amount):
-    uid = str(user_id)
-    data["coins"][uid] = data["coins"].get(uid, 0) + int(amount)
-    save_data(data)
+# ==== CHATGPT ====
+@bot.command()
+async def ask(ctx,*,q):
+    if not OPENAI_KEY: return await ctx.send("Chưa config API key")
+    try:
+        resp=openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role":"user","content":q}]
+        )
+        await ctx.send(resp["choices"][0]["message"]["content"][:1900])
+    except Exception as e:
+        await ctx.send(f"Lỗi API: {e}")
+
+# ==== ADMIN ====
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def editbal(ctx,m:discord.Member,amt:int):
+    data["coins"][str(m.id)]=amt; save(data)
+    await ctx.send(f"{m.display_name} = {amt} 💰")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def adcmd(ctx):
+    await ctx.send("Admin cmds: ?editbal | ?clear | ?kick | ?ban")
+
+# ==== OWNER ====
+def is_owner():
+    async def pred(ctx): return ctx.author.id==OWNER_ID
+    return commands.check(pred)
+
+@bot.command()
+@is_owner()
+async def shutdown(ctx): await ctx.send("Tắt bot"); await bot.close()
+
+@bot.command()
+@is_owner()
+async def owncmd(ctx): await ctx.send("Owner cmds: ?shutdown | ?eval")
+
+# ==== RUN ====
+if TOKEN: bot.run(TOKEN)
+else: print("❌ Thiếu DISCORD_TOKEN")
